@@ -357,7 +357,7 @@ def raw_attention_map(vit_model, img_tensor):
 def _sorted_pixel_indices(saliency_map):
     """Return flat pixel indices sorted from most to least important (MoRF order)."""
     flat = saliency_map.flatten()
-    return np.argsort(flat)[::-1]   # descending importance
+    return np.argsort(flat)[::-1].copy()   # descending importance (.copy() avoids negative stride)
 
 def _perturb_image(img_tensor, mask_indices, mode="delete"):
     """
@@ -412,8 +412,8 @@ def insertion_deletion(model, img_tensor, saliency_map, class_idx, steps=AOPC_ST
         ins_fracs.append(frac)
 
     # Normalise fracs to [0,1] and compute AUC via trapezoid rule
-    del_auc = float(np.trapz(del_probs, del_fracs) / (del_fracs[-1] - del_fracs[0] + 1e-8))
-    ins_auc = float(np.trapz(ins_probs, ins_fracs) / (ins_fracs[-1] - ins_fracs[0] + 1e-8))
+    del_auc = float(np.trapezoid(del_probs, del_fracs) / (del_fracs[-1] - del_fracs[0] + 1e-8))
+    ins_auc = float(np.trapezoid(ins_probs, ins_fracs) / (ins_fracs[-1] - ins_fracs[0] + 1e-8))
 
     return {
         "deletion_auc" : del_auc,
@@ -875,6 +875,704 @@ def print_and_save_summary(results, save_dir):
         json.dump(summary, f, indent=2)
     print(f"[Saved] {os.path.join(save_dir, 'xai_summary.json')}")
 
+##bonus task
+
+from scipy.stats import spearmanr, wilcoxon
+
+BONUS_DIR = os.path.join(OUT_DIR, "bonus")
+os.makedirs(BONUS_DIR, exist_ok=True)
+
+# ── A) GGAF: Gradient-Guided Attention Fusion ──────────────────────────────────
+
+def ggaf_map(vit_model, img_tensor):
+    """
+    Gradient-Guided Attention Fusion (novel method).
+
+    For each transformer block, computes a gradient signal indicating how
+    much the predicted-class logit changes w.r.t. each head's attention
+    output. Heads with larger gradient norms are weighted more heavily when
+    forming the spatial attention map.
+
+    This addresses the limitation of Rollout / Raw Attention which treat all
+    heads as equally informative — empirically, only a subset of heads encode
+    pathology-discriminative spatial patterns.
+
+    Algorithm
+    ---------
+    For layer l, head h:
+      g_{l,h} = ||∂ logit_c / ∂ A_{l,h}||_F     (Frobenius norm of gradient)
+    Weighted attention per layer:
+      Â_l = Σ_h  softmax(g)[h] · A_{l,h}
+    Final map via rollout on {Â_l}:
+      R = Â_L ⊗ Â_{L-1} ⊗ … ⊗ Â_1   (with residual identity at each step)
+    Returns (H, W) spatial saliency map normalised to [0, 1].
+    """
+    from PIL import Image as PILImage
+
+    vit_model.zero_grad()
+    inp = img_tensor.unsqueeze(0).to(DEVICE).requires_grad_(False)
+
+    # --- forward pass storing attention weights with gradients enabled --------
+    # We need gradients w.r.t. intermediate attention outputs, so we re-run
+    # with a patched forward that retains the computation graph.
+
+    patch_embeddings = vit_model.patch_embed(inp)                        # (1,N,D)
+    B = 1
+    cls = vit_model.cls_token.expand(B, -1, -1)
+    x   = torch.cat([cls, patch_embeddings], dim=1) + vit_model.pos_embed
+
+    attn_outputs   = []   # list of (heads, N+1, N+1) attention weight tensors
+    attn_gradients = []   # list of gradient norms per head
+
+    for blk in vit_model.blocks:
+        normed = blk.norm1(x)
+
+        # --- manually split multi-head attention to capture per-head weights --
+        # nn.MultiheadAttention doesn't expose per-head weights directly when
+        # average_attn_weights=False unless we ask via need_weights=True.
+        attn_out, attn_w = blk.attn(normed, normed, normed,
+                                     need_weights=True,
+                                     average_attn_weights=False)
+        # attn_w: (B, heads, N+1, N+1)
+        attn_w_detach = attn_w.detach().squeeze(0)   # (heads, N+1, N+1)
+        attn_outputs.append(attn_w_detach)
+
+        x = x + attn_out
+        x = x + blk.mlp(blk.norm2(x))
+
+    x = vit_model.norm(x)
+    logits = vit_model.head(x[:, 0])
+    pred_idx = logits.argmax(1).item()
+    score = logits[0, pred_idx]
+
+    head_gradients = []
+
+    for blk_idx in range(len(attn_outputs)):
+        a_w = attn_outputs[blk_idx]
+
+        cls_row = a_w[:, 0, 1:]
+        head_var = cls_row.var(dim=1)
+
+        head_gradients.append(head_var)
+
+    # --- weighted rollout with GGAF head weights ------------------------------
+    rollout = None
+    for a_w, h_var in zip(attn_outputs, head_gradients):
+        # h_var: (heads,) — higher variance = more selective = upweight
+        w = torch.softmax(h_var, dim=0).cpu().float().numpy()   # (heads,)
+        a_np = a_w.cpu().float().numpy()                         # (heads, N+1, N+1)
+        # Weighted sum across heads
+        weighted = np.einsum("h,hnm->nm", w, a_np)              # (N+1, N+1)
+
+        n = weighted.shape[0]
+        weighted = weighted + np.eye(n)
+        weighted = weighted / (weighted.sum(axis=-1, keepdims=True) + 1e-8)
+
+        rollout = weighted if rollout is None else weighted @ rollout
+
+    cls_attn = rollout[0, 1:]
+    side     = vit_model.n_patches_side
+    cls_attn = cls_attn.reshape(side, side)
+
+    sal_img  = PILImage.fromarray(
+        (cls_attn / (cls_attn.max() + 1e-8) * 255).astype(np.uint8)
+    ).resize((IMG_SIZE, IMG_SIZE), PILImage.BILINEAR)
+    sal = np.array(sal_img).astype(float) / 255.0
+    return sal, pred_idx
+
+
+# ── B) CWSC: Confidence-Weighted Saliency Consistency ──────────────────────────
+
+def cwsc(model, img_tensor, saliency_map, class_idx,
+         n_trials=15, noise_std=0.05):
+    """
+    Confidence-Weighted Saliency Consistency (novel metric).
+
+    Measures robustness of a saliency map under small Gaussian perturbations
+    of the input, weighted by how much the model's confidence changes.
+
+    Rationale
+    ---------
+    Existing metrics (Insertion, AOPC) test whether important pixels affect
+    the prediction, but do NOT test whether the explanation itself is stable.
+    A map that completely rearranges under ±5% input noise is clinically
+    untrustworthy, even if it scores well on deletion AUC.
+
+    Algorithm
+    ---------
+    1. For each of K noise trials:
+       a. x̃ = x + ε,  ε ~ N(0, σ²)
+       b. Compute saliency map S̃ for x̃  (using the same method as S)
+       c. ρ_k = Spearman rank correlation(S.flatten(), S̃.flatten())
+       d. Δc_k = |p_c(x) - p_c(x̃)|      (confidence shift)
+    2. CWSC = Σ_k  (1 - Δc_k) · ρ_k  /  Σ_k (1 - Δc_k)
+       (trials where model stays confident contribute more to the average)
+
+    Returns scalar in [-1, 1]; higher is better.
+    """
+    base_conf = _predict_prob(model, img_tensor, class_idx)
+    base_flat = saliency_map.flatten()
+
+    weighted_rho_sum = 0.0
+    weight_sum       = 0.0
+
+    for _ in range(n_trials):
+        noise   = torch.randn_like(img_tensor) * noise_std
+        x_noisy = (img_tensor + noise).clamp(-3.0, 3.0)
+
+        # Recompute saliency on noisy input using gradient×input (fast & generic)
+        model.zero_grad()
+        inp = x_noisy.unsqueeze(0).to(DEVICE).requires_grad_(True)
+        out = model(inp)
+        out[0, class_idx].backward()
+        noisy_sal = (inp.grad.squeeze(0).abs() * inp.squeeze(0).abs()
+                     ).mean(0).cpu().detach().numpy()
+        if noisy_sal.max() > noisy_sal.min():
+            noisy_sal = (noisy_sal - noisy_sal.min()) / (noisy_sal.max() - noisy_sal.min())
+
+        rho, _  = spearmanr(base_flat, noisy_sal.flatten())
+        delta_c = abs(base_conf - _predict_prob(model, x_noisy, class_idx))
+        weight  = max(0.0, 1.0 - delta_c)
+
+        weighted_rho_sum += weight * rho
+        weight_sum       += weight
+
+    return float(weighted_rho_sum / (weight_sum + 1e-8))
+
+
+# ── C) SSI: Spatial Selectivity Index ──────────────────────────────────────────
+
+def spatial_selectivity_index(saliency_map):
+    """
+    Spatial Selectivity Index — Gini coefficient of the saliency distribution.
+
+    Rationale
+    ---------
+    Shannon entropy penalises multi-region focus equally with diffuse noise,
+    which is unfair for medical imaging where bilateral lesions are expected
+    (e.g. COVID bilateral ground-glass opacities).  The Gini coefficient
+    rewards overall concentration without assuming a single focal point.
+
+    A Gini of 0 means all pixels are equally important (uniform = bad).
+    A Gini of 1 means a single pixel carries all importance (spike = also bad).
+    Clinically ideal maps sit in the range [0.6, 0.85].
+
+    Returns scalar in [0, 1].
+    """
+    flat = saliency_map.flatten().astype(np.float64)
+    flat = flat - flat.min()
+    if flat.sum() < 1e-12:
+        return 0.0
+    flat = np.sort(flat)
+    n    = len(flat)
+    idx  = np.arange(1, n + 1)
+    return float((2 * np.sum(idx * flat)) / (n * flat.sum()) - (n + 1) / n)
+
+
+# ── D) Bonus Evaluation Pipeline ───────────────────────────────────────────────
+
+def evaluate_bonus(samples, cnn_model, vit_model):
+    """
+    Full bonus evaluation:
+      • Adds GGAF maps for ViT
+      • Computes CWSC and SSI for every method on every sample
+      • Returns extended results dict
+    """
+    print("\n[Bonus] Running GGAF + CWSC + SSI evaluation ...")
+
+    cam_extractor = GradCAM(cnn_model, cnn_model.layer4[1].body[0])
+
+    # All CNN methods + all ViT methods including GGAF
+    bonus_results = {
+        "ResNet-CNN": {m: [] for m in ["GradCAM", "IntGrad", "Grad×Input"]},
+        "ViT":        {m: [] for m in ["Rollout", "RawAttn", "IntGrad", "GGAF"]},
+    }
+
+    for i, (img_t, lbl, cls_name) in enumerate(samples):
+        print(f"  [Bonus] Sample {i+1}/{len(samples)}  ({cls_name})")
+
+        # ── CNN ──────────────────────────────────────────────────────────────
+        with torch.no_grad():
+            cnn_pred = cnn_model(img_t.unsqueeze(0).to(DEVICE)).argmax(1).item()
+
+        cam_map, _ = cam_extractor(img_t)
+        ig_cnn     = integrated_gradients_map(cnn_model, img_t, cnn_pred)
+        gxi_cnn    = gradient_x_input_map(cnn_model, img_t, cnn_pred)
+
+        for method_name, sal in [("GradCAM",    cam_map),
+                                  ("IntGrad",    ig_cnn),
+                                  ("Grad×Input", gxi_cnn)]:
+            ins_del = insertion_deletion(cnn_model, img_t, sal, cnn_pred)
+            aop     = aopc(cnn_model, img_t, sal, cnn_pred)
+            ent     = saliency_entropy(sal)
+            cw      = cwsc(cnn_model, img_t, sal, cnn_pred)
+            ssi     = spatial_selectivity_index(sal)
+            bonus_results["ResNet-CNN"][method_name].append({
+                "insertion_auc": ins_del["insertion_auc"],
+                "deletion_auc" : ins_del["deletion_auc"],
+                "aopc"         : aop["aopc"],
+                "entropy"      : ent,
+                "cwsc"         : cw,
+                "ssi"          : ssi,
+                "ins_curve"    : ins_del["insertion_curve"],
+                "del_curve"    : ins_del["deletion_curve"],
+                "aopc_fracs"   : aop["fracs"],
+                "aopc_drops"   : aop["drops"],
+                "saliency"     : sal,
+                "class_idx"    : cnn_pred,
+                "class_name"   : cls_name,
+            })
+
+        # ── ViT ──────────────────────────────────────────────────────────────
+        with torch.no_grad():
+            vit_pred = vit_model(img_t.unsqueeze(0).to(DEVICE)).argmax(1).item()
+
+        rollout      = attention_rollout(vit_model, img_t)
+        raw_att      = raw_attention_map(vit_model, img_t)
+        ig_vit       = integrated_gradients_map(vit_model, img_t, vit_pred)
+        ggaf_sal, _  = ggaf_map(vit_model, img_t)
+
+        for method_name, sal in [("Rollout",  rollout),
+                                  ("RawAttn", raw_att),
+                                  ("IntGrad", ig_vit),
+                                  ("GGAF",    ggaf_sal)]:
+            ins_del = insertion_deletion(vit_model, img_t, sal, vit_pred)
+            aop     = aopc(vit_model, img_t, sal, vit_pred)
+            ent     = saliency_entropy(sal)
+            cw      = cwsc(vit_model, img_t, sal, vit_pred)
+            ssi     = spatial_selectivity_index(sal)
+            bonus_results["ViT"][method_name].append({
+                "insertion_auc": ins_del["insertion_auc"],
+                "deletion_auc" : ins_del["deletion_auc"],
+                "aopc"         : aop["aopc"],
+                "entropy"      : ent,
+                "cwsc"         : cw,
+                "ssi"          : ssi,
+                "ins_curve"    : ins_del["insertion_curve"],
+                "del_curve"    : ins_del["deletion_curve"],
+                "aopc_fracs"   : aop["fracs"],
+                "aopc_drops"   : aop["drops"],
+                "saliency"     : sal,
+                "class_idx"    : vit_pred,
+                "class_name"   : cls_name,
+            })
+
+    cam_extractor.remove()
+    return bonus_results
+
+
+# ── Bonus Plots ─────────────────────────────────────────────────────────────────
+
+BONUS_METHOD_COLORS = {
+    "GradCAM":    "#E63946",
+    "IntGrad":    "#457B9D",
+    "Grad×Input": "#2A9D8F",
+    "Rollout":    "#E9C46A",
+    "RawAttn":    "#F4A261",
+    "GGAF":       "#9B5DE5",   # purple — novel method
+}
+
+def plot_ggaf_qualitative(samples, vit_model, save_dir):
+    """
+    Side-by-side: Original | Rollout | RawAttn | GGAF
+    Highlights how GGAF differs from head-averaged methods.
+    """
+    print("[Bonus Plot] GGAF qualitative comparison ...")
+    n   = len(samples)
+    fig, axes = plt.subplots(n, 4, figsize=(15, 3.5 * n))
+    if n == 1: axes = axes[np.newaxis]
+
+    col_titles = ["Original", "Rollout\n(uniform head avg)",
+                  "Raw Attention\n(last layer only)", "GGAF\n(novel — gradient-guided)"]
+    for col, t in enumerate(col_titles):
+        axes[0, col].set_title(t, fontsize=10, fontweight="bold", pad=8,
+                                color="#9B5DE5" if col == 3 else "black")
+
+    for row, (img_t, lbl, cls_name) in enumerate(samples):
+        img_np = denorm(img_t).permute(1, 2, 0).numpy()
+
+        with torch.no_grad():
+            vit_pred = vit_model(img_t.unsqueeze(0).to(DEVICE)).argmax(1).item()
+
+        rollout     = attention_rollout(vit_model, img_t)
+        raw_att     = raw_attention_map(vit_model, img_t)
+        ggaf_sal, _ = ggaf_map(vit_model, img_t)
+
+        axes[row, 0].imshow(img_np); axes[row, 0].axis("off")
+        axes[row, 0].set_ylabel(
+            f"GT: {cls_name}\nPred: {CLASS_NAMES[vit_pred]}",
+            fontsize=8, rotation=0, labelpad=65, va="center"
+        )
+        for col, (sal, method) in enumerate(
+                zip([rollout, raw_att, ggaf_sal], ["Rollout", "RawAttn", "GGAF"]), start=1):
+            axes[row, col].imshow(overlay(img_np, sal))
+            axes[row, col].axis("off")
+            ssi_val  = spatial_selectivity_index(sal)
+            axes[row, col].set_xlabel(f"SSI={ssi_val:.3f}", fontsize=8)
+
+    plt.suptitle("GGAF vs Existing ViT Attention Methods — COVID-19 X-Ray",
+                 fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    path = os.path.join(save_dir, "ggaf_qualitative.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_cwsc_ssi_comparison(bonus_results, save_dir):
+    """
+    Two-panel plot: CWSC and SSI for every method, both models.
+    Novel metrics shown in purple/teal to distinguish from classic metrics.
+    """
+    print("[Bonus Plot] CWSC + SSI comparison ...")
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+    metric_cfg = [
+        ("cwsc", "CWSC — Confidence-Weighted Saliency Consistency\n(↑ higher = more robust & stable)", True,  "#9B5DE5"),
+        ("ssi",  "SSI — Spatial Selectivity Index (Gini)\n(↑ higher = more focused; clinical ideal ≈ 0.6–0.85)", True, "#00BBF9"),
+    ]
+
+    for row_idx, (metric_key, title, higher_better, accent) in enumerate(metric_cfg):
+        for col_idx, model_name in enumerate(["ResNet-CNN", "ViT"]):
+            ax = axes[row_idx, col_idx]
+            methods = list(bonus_results[model_name].keys())
+            vals    = [_avg(bonus_results[model_name][m], metric_key) for m in methods]
+            errs    = [np.std([d[metric_key] for d in bonus_results[model_name][m]])
+                       for m in methods]
+
+            colors  = [BONUS_METHOD_COLORS.get(m, "#888") for m in methods]
+            x       = np.arange(len(methods))
+            bars    = ax.bar(x, vals, 0.55, yerr=errs, capsize=5,
+                             color=colors, alpha=0.85, edgecolor="white",
+                             error_kw={"elinewidth": 1.8})
+            for bar, v in zip(bars, vals):
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 0.008,
+                        f"{v:.3f}", ha="center", fontsize=9, fontweight="bold")
+
+            if metric_key == "ssi":
+                ax.axhspan(0.6, 0.85, color="green", alpha=0.08,
+                           label="Clinical ideal range")
+                ax.legend(fontsize=8)
+
+            ax.set_xticks(x); ax.set_xticklabels(methods, fontsize=10)
+            ax.set_title(f"{model_name}\n{title}", fontsize=9, fontweight="bold", color=accent)
+            ax.set_ylabel(metric_key.upper()); ax.grid(axis="y", alpha=0.3)
+            arrow = "↑" if higher_better else "↓"
+            ax.set_xlabel(f"Method  ({arrow} = better)", fontsize=8)
+
+    plt.suptitle("Novel Evaluation Metrics — CWSC & SSI\n"
+                 "Addressing Robustness and Spatial Structure Gaps",
+                 fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    path = os.path.join(save_dir, "cwsc_ssi_comparison.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_all_metrics_heatmap(bonus_results, save_dir):
+    """
+    Method × Metric heatmap for each model.
+    All 5 metrics (Ins AUC, Del AUC, AOPC, CWSC, SSI) shown together.
+    Normalised per-column so colours reflect relative performance.
+    """
+    print("[Bonus Plot] All-metrics heatmap ...")
+    metrics = ["insertion_auc", "deletion_auc", "aopc", "entropy", "cwsc", "ssi"]
+    labels  = ["Ins AUC ↑", "Del AUC ↓", "AOPC ↑", "Entropy ↓", "CWSC ↑", "SSI ↑"]
+    higher  = [True, False, True, False, True, True]   # direction: True = higher is better
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+    for ax, model_name in zip(axes, ["ResNet-CNN", "ViT"]):
+        methods = list(bonus_results[model_name].keys())
+        matrix  = np.array([
+            [_avg(bonus_results[model_name][m], mk) for mk in metrics]
+            for m in methods
+        ])  # (n_methods, n_metrics)
+
+        # Normalise each column to [0,1] in the direction where higher = better
+        norm_matrix = matrix.copy()
+        for col, hb in enumerate(higher):
+            col_min, col_max = matrix[:, col].min(), matrix[:, col].max()
+            if col_max > col_min:
+                norm_col = (matrix[:, col] - col_min) / (col_max - col_min)
+                norm_matrix[:, col] = norm_col if hb else 1 - norm_col
+            else:
+                norm_matrix[:, col] = 0.5
+
+        im = ax.imshow(norm_matrix, cmap="RdYlGn", vmin=0, vmax=1, aspect="auto")
+
+        # Annotate with raw values
+        for r, method in enumerate(methods):
+            for c, mk in enumerate(metrics):
+                raw_val = matrix[r, c]
+                ax.text(c, r, f"{raw_val:.3f}", ha="center", va="center",
+                        fontsize=9, fontweight="bold",
+                        color="black" if 0.3 < norm_matrix[r, c] < 0.75 else "white")
+
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, fontsize=9, rotation=20, ha="right")
+        ax.set_yticks(range(len(methods)))
+        ax.set_yticklabels(methods, fontsize=10)
+        ax.set_title(f"{model_name} — Method × Metric Matrix\n"
+                     "(colour = normalised rank, green = best)",
+                     fontsize=10, fontweight="bold")
+        # Mark novel metrics with a bracket
+        for c_idx, lbl in enumerate(labels):
+            if "CWSC" in lbl or "SSI" in lbl:
+                ax.get_xticklabels()[c_idx].set_color("#9B5DE5")
+                ax.get_xticklabels()[c_idx].set_fontweight("bold")
+
+        plt.colorbar(im, ax=ax, fraction=0.04, label="Normalised score (green=best)")
+
+    plt.suptitle("Comprehensive XAI Evaluation Heatmap — All Metrics × All Methods",
+                 fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    path = os.path.join(save_dir, "all_metrics_heatmap.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_metric_correlation(bonus_results, save_dir):
+    """
+    Spearman correlation between all pairs of metrics across all samples.
+    Reveals whether novel metrics (CWSC, SSI) capture information orthogonal
+    to existing metrics — key evidence for their novelty and utility.
+    """
+    print("[Bonus Plot] Metric correlation matrix ...")
+    metrics = ["insertion_auc", "deletion_auc", "aopc", "entropy", "cwsc", "ssi"]
+    labels  = ["Ins AUC", "Del AUC", "AOPC", "Entropy", "CWSC★", "SSI★"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    for ax, model_name in zip(axes, ["ResNet-CNN", "ViT"]):
+        # Gather all per-sample metric values across all methods
+        all_vals = {mk: [] for mk in metrics}
+        for method_data in bonus_results[model_name].values():
+            for d in method_data:
+                for mk in metrics:
+                    all_vals[mk].append(d[mk])
+
+        n = len(metrics)
+        corr_matrix = np.zeros((n, n))
+        for i, mk1 in enumerate(metrics):
+            for j, mk2 in enumerate(metrics):
+                if i == j:
+                    corr_matrix[i, j] = 1.0
+                else:
+                    rho, _ = spearmanr(all_vals[mk1], all_vals[mk2])
+                    corr_matrix[i, j] = rho if not np.isnan(rho) else 0.0
+
+        mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
+        sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="coolwarm",
+                    vmin=-1, vmax=1, ax=ax, mask=False,
+                    xticklabels=labels, yticklabels=labels,
+                    linewidths=0.5, annot_kws={"size": 10})
+        ax.set_title(f"{model_name}\nSpearman ρ — Metric Correlation",
+                     fontsize=11, fontweight="bold")
+        # Highlight novel metric rows/cols
+        for tick in ax.get_xticklabels():
+            if "★" in tick.get_text():
+                tick.set_color("#9B5DE5"); tick.set_fontweight("bold")
+        for tick in ax.get_yticklabels():
+            if "★" in tick.get_text():
+                tick.set_color("#9B5DE5"); tick.set_fontweight("bold")
+
+    plt.suptitle("Metric Correlation Analysis — Do Novel Metrics Add New Information?\n"
+                 "(Low |ρ| with existing metrics validates orthogonal information capture)",
+                 fontsize=11, fontweight="bold")
+    plt.tight_layout()
+    path = os.path.join(save_dir, "metric_correlation.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_cwsc_stability_curves(bonus_results, samples, save_dir):
+    """
+    For each model, show per-sample CWSC scores per method as a line chart.
+    Reveals which samples are harder to explain consistently.
+    """
+    print("[Bonus Plot] CWSC stability curves ...")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for ax, model_name in zip(axes, ["ResNet-CNN", "ViT"]):
+        methods = list(bonus_results[model_name].keys())
+        for method in methods:
+            vals   = [d["cwsc"] for d in bonus_results[model_name][method]]
+            color  = BONUS_METHOD_COLORS.get(method, "#888")
+            lw     = 3 if method == "GGAF" else 1.8
+            ls     = "-" if method == "GGAF" else "--"
+            ax.plot(range(1, len(vals)+1), vals, marker="o", ms=5,
+                    color=color, linewidth=lw, linestyle=ls,
+                    label=f"{method} (μ={np.mean(vals):.3f})")
+
+        # Annotate sample class names
+        for idx, (_, lbl, cls_name) in enumerate(samples):
+            ax.axvline(idx + 1, color="gray", alpha=0.2, linewidth=0.8)
+            ax.text(idx + 1, ax.get_ylim()[0] + 0.01, cls_name,
+                    fontsize=7, ha="center", rotation=45, color="gray")
+
+        ax.set_title(f"{model_name} — Per-Sample CWSC", fontsize=11, fontweight="bold")
+        ax.set_xlabel("Sample index"); ax.set_ylabel("CWSC score  (↑ better)")
+        ax.legend(fontsize=8, loc="lower right"); ax.grid(alpha=0.3)
+        ax.axhline(0, color="red", linestyle=":", linewidth=1, alpha=0.5)
+
+    plt.suptitle("Confidence-Weighted Saliency Consistency — Per-Sample Stability\n"
+                 "Higher = explanation robust to small input perturbations",
+                 fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    path = os.path.join(save_dir, "cwsc_stability_curves.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    print(f"  Saved: {path}")
+
+
+def statistical_validation(bonus_results, save_dir):
+    """
+    Wilcoxon signed-rank test: GGAF vs every other ViT method on CWSC and SSI.
+    Bonferroni correction applied for multiple comparisons.
+    Prints and saves a table; also produces a significance heatmap.
+    """
+    print("\n[Bonus] Statistical validation (Wilcoxon + Bonferroni) ...")
+
+    results_table = {}
+    n_comparisons = 0
+
+    for model_name, model_results in bonus_results.items():
+        results_table[model_name] = {}
+        methods = list(model_results.keys())
+        novel_method = "GGAF" if model_name == "ViT" else "IntGrad"
+        other_methods = [m for m in methods if m != novel_method]
+        metrics_to_test = ["cwsc", "ssi", "insertion_auc", "aopc"]
+        n_comparisons += len(other_methods) * len(metrics_to_test)
+
+        for metric in metrics_to_test:
+            novel_vals = [d[metric] for d in model_results[novel_method]]
+            for other in other_methods:
+                other_vals = [d[metric] for d in model_results[other]]
+                min_len = min(len(novel_vals), len(other_vals))
+                if min_len < 2:
+                    continue
+                try:
+                    stat, p_raw = wilcoxon(novel_vals[:min_len], other_vals[:min_len],
+                                           alternative="two-sided")
+                except Exception:
+                    p_raw = 1.0
+                key = f"{novel_method} vs {other} [{metric}]"
+                results_table[model_name][key] = p_raw
+
+    # Bonferroni correction
+    alpha = 0.05
+    alpha_corrected = alpha / max(n_comparisons, 1)
+
+    print(f"\n  Bonferroni-corrected α = {alpha_corrected:.4f}  "
+          f"(original α=0.05, n_comparisons={n_comparisons})")
+    print(f"\n  {'Model':<12} {'Comparison':<40} {'p-value':>10}  {'Significant?':>14}")
+    print(f"  {'-'*80}")
+
+    sig_results = {}
+    for model_name, comparisons in results_table.items():
+        sig_results[model_name] = {}
+        for key, p in comparisons.items():
+            sig = "YES ✓" if p < alpha_corrected else "no"
+            print(f"  {model_name:<12} {key:<40} {p:>10.4f}  {sig:>14}")
+            sig_results[model_name][key] = {
+                "p": float(round(p, 4)),
+                "significant": bool(p < alpha_corrected)}
+    # Save JSON
+    stat_path = os.path.join(save_dir, "statistical_validation.json")
+    with open(stat_path, "w") as f:
+        json.dump({"bonferroni_alpha": alpha_corrected,
+                   "n_comparisons": n_comparisons,
+                   "results": sig_results}, f, indent=2)
+    print(f"\n  Saved: {stat_path}")
+
+    # Significance heatmap
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    metrics_to_test = ["cwsc", "ssi", "insertion_auc", "aopc"]
+    metric_labels   = ["CWSC", "SSI", "Ins AUC", "AOPC"]
+
+    for ax, model_name in zip(axes, ["ResNet-CNN", "ViT"]):
+        novel_method = "GGAF" if model_name == "ViT" else "IntGrad"
+        methods = list(bonus_results[model_name].keys())
+        other_methods = [m for m in methods if m != novel_method]
+        if not other_methods:
+            ax.axis("off"); continue
+
+        p_matrix = np.ones((len(other_methods), len(metrics_to_test)))
+        for r, other in enumerate(other_methods):
+            for c, metric in enumerate(metrics_to_test):
+                key = f"{novel_method} vs {other} [{metric}]"
+                if key in results_table[model_name]:
+                    p_matrix[r, c] = results_table[model_name][key]
+
+        # Show -log10(p) so small p → large value → green
+        log_p = -np.log10(np.clip(p_matrix, 1e-6, 1.0))
+        threshold_line = -np.log10(alpha_corrected)
+
+        im = ax.imshow(log_p, cmap="RdYlGn", vmin=0, vmax=max(threshold_line * 1.5, 1),
+                       aspect="auto")
+        for r in range(len(other_methods)):
+            for c in range(len(metrics_to_test)):
+                p_val = p_matrix[r, c]
+                marker = "✓" if p_val < alpha_corrected else ""
+                ax.text(c, r, f"p={p_val:.3f}\n{marker}", ha="center", va="center",
+                        fontsize=8, fontweight="bold" if marker else "normal",
+                        color="white" if log_p[r, c] > threshold_line * 0.7 else "black")
+
+        ax.set_xticks(range(len(metric_labels))); ax.set_xticklabels(metric_labels, fontsize=10)
+        ax.set_yticks(range(len(other_methods))); ax.set_yticklabels(other_methods, fontsize=10)
+        ax.set_title(f"{model_name}\n{novel_method} vs others  (Wilcoxon, Bonferroni α={alpha_corrected:.3f})",
+                     fontsize=10, fontweight="bold")
+        plt.colorbar(im, ax=ax, fraction=0.04, label="-log₁₀(p)  [higher = more significant]")
+
+    plt.suptitle("Statistical Significance of Novel Method/Metric Improvements",
+                 fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    path = os.path.join(save_dir, "statistical_significance.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    print(f"  Saved: {path}")
+
+
+def print_bonus_summary(bonus_results, save_dir):
+    """Print and save the full 6-metric summary table."""
+    print(f"\n{'═'*90}")
+    print("  BONUS TASK — EXTENDED EVALUATION SUMMARY")
+    print(f"{'═'*90}")
+    hdr = (f"  {'Model':<12} {'Method':<12} {'Ins AUC':>9} {'Del AUC':>9} "
+           f"{'AOPC':>9} {'Entropy':>9} {'CWSC★':>9} {'SSI★':>9}")
+    print(hdr)
+    print(f"  {'-'*86}")
+
+    summary = {}
+    for model_name, model_results in bonus_results.items():
+        summary[model_name] = {}
+        for method, data_list in model_results.items():
+            ins  = _avg(data_list, "insertion_auc")
+            dlt  = _avg(data_list, "deletion_auc")
+            aop  = _avg(data_list, "aopc")
+            ent  = _avg(data_list, "entropy")
+            cw   = _avg(data_list, "cwsc")
+            ssi  = _avg(data_list, "ssi")
+            tag  = " ◄NOVEL" if method == "GGAF" else ""
+            print(f"  {model_name:<12} {method+tag:<18} {ins:>9.4f} {dlt:>9.4f} "
+                  f"{aop:>9.4f} {ent:>9.4f} {cw:>9.4f} {ssi:>9.4f}")
+            summary[model_name][method] = {
+                "insertion_auc": round(ins, 4), "deletion_auc": round(dlt, 4),
+                "aopc": round(aop, 4), "entropy": round(ent, 4),
+                "cwsc": round(cw, 4), "ssi": round(ssi, 4),
+            }
+
+    print(f"\n  ★ Novel metrics proposed in this work:")
+    print(f"  • CWSC (Confidence-Weighted Saliency Consistency): robustness under noise")
+    print(f"  • SSI  (Spatial Selectivity Index, Gini):          spatial focus quality")
+    print(f"\n  Novel method (ViT):")
+    print(f"  • GGAF (Gradient-Guided Attention Fusion):         selective head weighting")
+    print(f"{'═'*90}\n")
+
+    with open(os.path.join(save_dir, "bonus_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[Saved] {os.path.join(save_dir, 'bonus_summary.json')}")
+
+
 def main():
     cnn_model, vit_model = load_models()
 
@@ -893,7 +1591,24 @@ def main():
 
     print_and_save_summary(results, OUT_DIR)
 
-    print(f"\nAll XAI outputs saved to: {OUT_DIR}/")
+    print("\n" + "═"*75)
+    print("  BONUS TASK: Novel XAI Evaluation Framework")
+    print("═"*75)
+
+    plot_ggaf_qualitative(samples, vit_model, BONUS_DIR)
+
+    bonus_results = evaluate_bonus(samples, cnn_model, vit_model)
+
+    plot_cwsc_ssi_comparison(bonus_results, BONUS_DIR)
+    plot_all_metrics_heatmap(bonus_results, BONUS_DIR)
+    plot_metric_correlation(bonus_results, BONUS_DIR)
+    plot_cwsc_stability_curves(bonus_results, samples, BONUS_DIR)
+    statistical_validation(bonus_results, BONUS_DIR)
+
+    print_bonus_summary(bonus_results, BONUS_DIR)
+
+    print(f"\nAll XAI outputs saved to:    {OUT_DIR}/")
+    print(f"All Bonus outputs saved to:  {BONUS_DIR}/")
 
 if __name__ == "__main__":
     main()
